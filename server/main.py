@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import date, timedelta
+from uuid import uuid4
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -13,6 +15,18 @@ QUARTER_MAP = {
     'Q3-2025': ['2025-07', '2025-08', '2025-09'],
     'Q4-2025': ['2025-10', '2025-11', '2025-12']
 }
+
+# Fixed lead time (in days) per warehouse for restocking deliveries
+WAREHOUSE_LEAD_TIMES = {
+    'San Francisco': 3,
+    'Tokyo': 7,
+    'Berlin': 5,
+    'Singapore': 6
+}
+DEFAULT_LEAD_TIME_DAYS = 5
+
+# In-memory store for submitted restocking orders
+submitted_orders: List[dict] = []
 
 def filter_by_month(items: list, month: Optional[str]) -> list:
     """Filter items by month/quarter based on order_date field"""
@@ -119,6 +133,47 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockingRecommendation(BaseModel):
+    item_sku: str
+    item_name: str
+    warehouse: str
+    category: str
+    forecasted_demand: int
+    quantity_on_hand: int
+    recommended_quantity: int
+    unit_cost: float
+    line_total: float
+    lead_time_days: int
+
+class RestockingOrderLineRequest(BaseModel):
+    item_sku: str
+    quantity: int
+
+class CreateRestockingOrderRequest(BaseModel):
+    budget: float
+    items: List[RestockingOrderLineRequest]
+
+class SubmittedOrderLine(BaseModel):
+    item_sku: str
+    item_name: str
+    warehouse: str
+    quantity: int
+    unit_cost: float
+    line_total: float
+    lead_time_days: int
+    expected_delivery: str
+
+class SubmittedOrder(BaseModel):
+    id: str
+    order_number: str
+    submitted_at: str
+    budget: float
+    total_value: float
+    max_lead_time_days: int
+    expected_delivery: str
+    status: str
+    items: List[SubmittedOrderLine]
 
 # API endpoints
 @app.get("/")
@@ -303,6 +358,141 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+def _enrich_forecasts() -> List[dict]:
+    """Join demand forecasts with inventory data, with sensible fallbacks for
+    forecast SKUs that don't have a matching inventory row (the mock data
+    sets are only partially aligned by SKU). Returns rows sorted by highest
+    forecasted demand first."""
+    inventory_by_sku = {item['sku']: item for item in inventory_items}
+    costs = sorted(item['unit_cost'] for item in inventory_items)
+    fallback_cost = costs[len(costs) // 2] if costs else 25.0
+    warehouses = list(WAREHOUSE_LEAD_TIMES.keys()) or ['San Francisco']
+
+    enriched = []
+    for idx, fc in enumerate(demand_forecasts):
+        inv = inventory_by_sku.get(fc['item_sku'])
+        if inv:
+            warehouse = inv['warehouse']
+            category = inv['category']
+            quantity_on_hand = inv['quantity_on_hand']
+            unit_cost = inv['unit_cost']
+        else:
+            warehouse = warehouses[idx % len(warehouses)]
+            category = 'Uncategorized'
+            quantity_on_hand = 0
+            unit_cost = fallback_cost
+        enriched.append({
+            'item_sku': fc['item_sku'],
+            'item_name': fc['item_name'],
+            'warehouse': warehouse,
+            'category': category,
+            'forecasted_demand': fc['forecasted_demand'],
+            'quantity_on_hand': quantity_on_hand,
+            'unit_cost': unit_cost,
+            'lead_time_days': WAREHOUSE_LEAD_TIMES.get(warehouse, DEFAULT_LEAD_TIME_DAYS),
+        })
+    enriched.sort(key=lambda r: r['forecasted_demand'], reverse=True)
+    return enriched
+
+
+def _build_recommendations(budget: float) -> List[dict]:
+    """Greedy allocation: walk forecasts by highest forecasted_demand and fill
+    up to forecast quantity per item, stopping when budget is exhausted."""
+    enriched = _enrich_forecasts()
+
+    remaining = float(budget)
+    recommendations = []
+    for r in enriched:
+        if r['unit_cost'] <= 0 or remaining < r['unit_cost']:
+            continue
+        max_affordable = int(remaining // r['unit_cost'])
+        qty = min(r['forecasted_demand'], max_affordable)
+        if qty <= 0:
+            continue
+        line_total = round(qty * r['unit_cost'], 2)
+        recommendations.append({**r, 'recommended_quantity': qty, 'line_total': line_total})
+        remaining -= line_total
+    return recommendations
+
+
+@app.get("/api/restocking/recommendations", response_model=List[RestockingRecommendation])
+def get_restocking_recommendations(budget: float = 0):
+    """Recommend items to restock given an available budget, prioritized by forecasted demand."""
+    if budget < 0:
+        raise HTTPException(status_code=400, detail="Budget must be non-negative")
+    return _build_recommendations(budget)
+
+
+@app.post("/api/restocking/orders", response_model=SubmittedOrder, status_code=201)
+def submit_restocking_order(request: CreateRestockingOrderRequest):
+    """Submit a restocking order. Stored in-memory and surfaced as a Submitted Order."""
+    if not request.items:
+        raise HTTPException(status_code=400, detail="Order must include at least one item")
+
+    # Use the same enrichment as the recommendations endpoint so orphan-SKU
+    # forecast items (no inventory match) can still be ordered with fallback
+    # pricing/warehouse data.
+    recs_by_sku = {r['item_sku']: r for r in _enrich_forecasts()}
+
+    lines = []
+    total_value = 0.0
+    max_lead = 0
+    today = date.today()
+
+    for line in request.items:
+        if line.quantity <= 0:
+            continue
+        rec = recs_by_sku.get(line.item_sku)
+        if not rec:
+            raise HTTPException(status_code=400, detail=f"Unknown SKU: {line.item_sku}")
+        lead = rec['lead_time_days']
+        line_total = round(line.quantity * rec['unit_cost'], 2)
+        total_value += line_total
+        max_lead = max(max_lead, lead)
+        lines.append({
+            'item_sku': rec['item_sku'],
+            'item_name': rec['item_name'],
+            'warehouse': rec['warehouse'],
+            'quantity': line.quantity,
+            'unit_cost': rec['unit_cost'],
+            'line_total': line_total,
+            'lead_time_days': lead,
+            'expected_delivery': (today + timedelta(days=lead)).isoformat(),
+        })
+
+    if not lines:
+        raise HTTPException(status_code=400, detail="Order must include at least one item with quantity > 0")
+
+    total_value = round(total_value, 2)
+    if total_value > request.budget:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Order total ${total_value:,.2f} exceeds budget ${request.budget:,.2f}"
+        )
+
+    order_id = str(uuid4())
+    order_number = f"RST-{len(submitted_orders) + 1:04d}"
+    order = {
+        'id': order_id,
+        'order_number': order_number,
+        'submitted_at': today.isoformat(),
+        'budget': request.budget,
+        'total_value': total_value,
+        'max_lead_time_days': max_lead,
+        'expected_delivery': (today + timedelta(days=max_lead)).isoformat(),
+        'status': 'Submitted',
+        'items': lines,
+    }
+    submitted_orders.append(order)
+    return order
+
+
+@app.get("/api/submitted-orders", response_model=List[SubmittedOrder])
+def get_submitted_orders():
+    """Return all restocking orders submitted during this server session, newest first."""
+    return list(reversed(submitted_orders))
+
 
 if __name__ == "__main__":
     import uvicorn
