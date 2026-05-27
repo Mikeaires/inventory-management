@@ -74,6 +74,62 @@
           </table>
         </div>
       </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3 class="card-title">Submitted Orders ({{ submittedOrders.length }})</h3>
+        </div>
+        <div v-if="submittedOrders.length === 0" class="empty-state">
+          No submitted restocking orders yet.
+        </div>
+        <div v-else class="table-container">
+          <table class="orders-table">
+            <thead>
+              <tr>
+                <th class="col-order-number">Order #</th>
+                <th class="col-date">Submitted</th>
+                <th class="col-items">Items</th>
+                <th class="col-warehouses">Warehouses</th>
+                <th class="col-value">Total Value</th>
+                <th class="col-lead">Lead Time</th>
+                <th class="col-date">Expected Delivery</th>
+                <th class="col-status">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="order in submittedOrders" :key="order.id">
+                <td class="col-order-number"><strong>{{ order.order_number }}</strong></td>
+                <td class="col-date">{{ formatDate(order.submitted_at) }}</td>
+                <td class="col-items">
+                  <details class="items-details">
+                    <summary class="items-summary">
+                      {{ order.items.length }} items
+                    </summary>
+                    <div class="items-dropdown">
+                      <div v-for="line in order.items" :key="line.item_sku" class="item-entry">
+                        <span class="item-name">{{ line.item_sku }} — {{ line.item_name }}</span>
+                        <span class="item-meta">
+                          Qty: {{ line.quantity }} @ {{ currencySymbol }}{{ line.unit_cost.toLocaleString() }}
+                          · {{ line.warehouse }} ({{ line.lead_time_days }}d)
+                        </span>
+                      </div>
+                    </div>
+                  </details>
+                </td>
+                <td class="col-warehouses">{{ getOrderWarehouses(order) }}</td>
+                <td class="col-value"><strong>{{ currencySymbol }}{{ order.total_value.toLocaleString() }}</strong></td>
+                <td class="col-lead">{{ order.max_lead_time_days }} days</td>
+                <td class="col-date">{{ formatDate(order.expected_delivery) }}</td>
+                <td class="col-status">
+                  <span :class="['badge', getOrderStatusClass(order.status)]">
+                    {{ order.status }}
+                  </span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -95,6 +151,7 @@ export default {
     const loading = ref(true)
     const error = ref(null)
     const orders = ref([])
+    const submittedOrders = ref([])
 
     // Use shared filters
     const {
@@ -138,9 +195,24 @@ export default {
         'Delivered': 'success',
         'Shipped': 'info',
         'Processing': 'warning',
-        'Backordered': 'danger'
+        'Backordered': 'danger',
+        'Submitted': 'info'
       }
       return statusMap[status] || 'info'
+    }
+
+    const loadSubmittedOrders = async () => {
+      try {
+        submittedOrders.value = await api.getSubmittedOrders()
+      } catch (err) {
+        console.error('Failed to load submitted orders:', err)
+        submittedOrders.value = []
+      }
+    }
+
+    const getOrderWarehouses = (order) => {
+      const unique = [...new Set(order.items.map(i => i.warehouse))]
+      return unique.join(', ')
     }
 
     const formatDate = (dateString) => {
@@ -153,15 +225,20 @@ export default {
       })
     }
 
-    onMounted(loadOrders)
+    onMounted(() => {
+      loadOrders()
+      loadSubmittedOrders()
+    })
 
     return {
       t,
       loading,
       error,
       orders,
+      submittedOrders,
       getOrdersByStatus,
       getOrderStatusClass,
+      getOrderWarehouses,
       formatDate,
       currencySymbol,
       translateProductName,
@@ -201,6 +278,21 @@ export default {
 
 .col-value {
   width: 120px;
+}
+
+.col-warehouses {
+  width: 160px;
+}
+
+.col-lead {
+  width: 100px;
+}
+
+.empty-state {
+  text-align: center;
+  padding: 2.5rem 1rem;
+  color: #64748b;
+  font-size: 0.938rem;
 }
 
 /* Items details styling */
